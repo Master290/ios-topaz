@@ -1,0 +1,38 @@
+From: topaz
+Subject: [PATCH] IOMFB: print notification ports as pointers (0954 compile fix)
+
+mach_port_t is a pointer in the kernel. 0954's (uint32_t)port / (uint32_t)fPort
+casts fail to compile on arm64:
+
+  SweetFramebuffer.cpp:1491: error: cast from pointer to smaller type 'uint32_t'
+  SweetFramebuffer.cpp:1520: error: cast from pointer to smaller type 'uint32_t'
+
+CI run 42972073902 failed on that. Print the ports with %p.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1487,8 +1487,8 @@ IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, UInt32
+ 	{
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+-		IOLog("SWEET FB: %s registerNotificationPort port %u type %u\n",
+-		    name, (uint32_t)port, (uint32_t)type);
++		IOLog("SWEET FB: %s registerNotificationPort port %p type %u\n",
++		    name, (void *)port, (uint32_t)type);
+ 	}
+ 	if (old != MACH_PORT_NULL) {
+ 		releaseNotificationPort(old);
+@@ -1514,10 +1514,10 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ 		}
+ 		dropped++;
+ 		if (qemu && (dropped <= 8 || (dropped % 60) == 0)) {
+-			IOLog("SWEET FB: notify type %u dropped (func %p port %u, n %u)\n",
++			IOLog("SWEET FB: notify type %u dropped (func %p port %p, n %u)\n",
+ 			    type,
+ 			    (void *)(uintptr_t)(type < SWEET_FB_NOTIFY_TYPES ? fFunc[type] : 0),
+-			    (uint32_t)fPort, dropped);
++			    (void *)fPort, dropped);
+ 		}
+ 		return;
+ 	}
