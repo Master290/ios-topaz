@@ -1,0 +1,90 @@
+From: topaz
+Subject: [PATCH] IOMFB: log notification port and dropped vsync notifies; sel 74 ABI
+
+registerNotificationPort was unlogged, so it was unclear whether
+CoreAnimation set a port. notify() is a no-op until sel 72 sets
+fFunc[type]; the 16.67 ms vsync timer can fire and deliver nothing.
+Dropped-notify logs are rate-limited and gated by sweetqemu=1 so a
+phone boot is not spammed.
+
+Selector 74 (SupportedFrameInfo) is implemented after HackiOS
+MiniIOMobileFramebuffer (APSL 2.0): in: type; out: how many, and
+their tags: none (scalar 0, zeroed structure, success). That is the
+same payload the previous default path already returned. Do not invent
+tags: a wrong list would change CoreAnimation on a real phone.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -121,6 +121,7 @@ enum {
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBSupportedFrameInfo      = 74,
+ 	kSweetFBGetBlock                = 79,
+ };
+ 
+@@ -1475,7 +1476,7 @@ IOMobileFramebufferUserClient::clientClose(void)
+ }
+ 
+ IOReturn
+-IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, __unused UInt32 type,
++IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, UInt32 type,
+     __unused io_user_reference_t refCon)
+ {
+ 	mach_port_t old;
+@@ -1483,6 +1484,12 @@ IOMobileFramebufferUserClient::registerNotificationPort(mach_port_t port, __unus
+ 	old = fPort;
+ 	fPort = port;
+ 	IOLockUnlock(fFB->fLock);
++	{
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET FB: %s registerNotificationPort port %u type %u\n",
++		    name, (uint32_t)port, (uint32_t)type);
++	}
+ 	if (old != MACH_PORT_NULL) {
+ 		releaseNotificationPort(old);
+ 	}
+@@ -1496,6 +1503,22 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ 	OSAsyncReference64 ref;
+ 
+ 	if (type >= SWEET_FB_NOTIFY_TYPES || fFunc[type] == 0 || fPort == MACH_PORT_NULL) {
++		/* QEMU only: the 16.67 ms timer still fires, but notify() is a no-op
++		 * until sel 72 sets fFunc[type] and registerNotificationPort sets fPort.
++		 * Rate-limited so a phone boot is not spammed if it hits this path. */
++		static int qemu = -1;
++		static uint32_t dropped;
++		if (qemu < 0) {
++			uint32_t on = 0;
++			qemu = PE_parse_boot_argn("sweetqemu", &on, sizeof(on)) && on != 0;
++		}
++		dropped++;
++		if (qemu && (dropped <= 8 || (dropped % 60) == 0)) {
++			IOLog("SWEET FB: notify type %u dropped (func %p port %u, n %u)\n",
++			    type,
++			    (void *)(uintptr_t)(type < SWEET_FB_NOTIFY_TYPES ? fFunc[type] : 0),
++			    (uint32_t)fPort, dropped);
++		}
+ 		return;
+ 	}
+ 	bzero(ref, sizeof(ref));
+@@ -1554,6 +1577,18 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		out[0] = SWEET_FB_DOT_PITCH;
+ 		outCount = 1;
+ 		break;
++	case kSweetFBSupportedFrameInfo:
++		/*
++		 * in: type; out: how many, and their tags: none.
++		 * After HackiOS MiniIOMobileFramebuffer (APSL 2.0). This is also
++		 * what the previous default path returned (scalar 0, 64 zeroed
++		 * bytes, success). Do not invent tags: a wrong list would change
++		 * CoreAnimation on a real phone. The generic tail still logs sel 74
++		 * (selectors >= 64) and bzeros structureOutput.
++		 */
++		out[0] = 0;
++		outCount = 1;
++		break;
+ 	case kSweetFBGetBlock:
+ 		/*
+ 		 * Block 0x40, the current mode: its colour and timing identifiers (publishModes). Zeros

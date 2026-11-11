@@ -1,0 +1,36 @@
+From: topaz
+Subject: [PATCH] qemu: IOSurface scanout pool may use PA above 4 GiB when sweetqemu=1
+
+The 0x00000000fffff000 mask is for the phone display SMMU. In QEMU the
+"panel" is a CPU copy into boot-args FB memory, and the 4 GiB rd=md0
+ramdisk sits in topOfKernelData, leaving no VM pages below 4 GiB.
+With sweetqemu=1, use a 40-bit physically-contiguous mask and do not
+reject PA >= 4 GiB. Phone boots (no sweetqemu) are unchanged.
+---
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1036,12 +1036,21 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			 * Real RAM, physically contiguous and below 4 GiB (the display SMMU is
+ 			 * bypassed). A raw physical window outside the kernel's RAM maps as
+ 			 * Device memory, where bzero/memcpy take alignment faults.
++			 * QEMU (sweetqemu=1) has no 32-bit SMMU; the 4 GiB rd=md0 ramdisk sits
++			 * in topOfKernelData and leaves no VM pages below 4 GiB, so allow a
++			 * 40-bit physical mask and PA above 4 GiB. Phone boots are unchanged.
+ 			 */
++			static int qemu = -1;
++			if (qemu < 0) {
++				uint32_t on = 0;
++				qemu = PE_parse_boot_argn("sweetqemu", &on, sizeof(on)) && on != 0;
++			}
++			mach_vm_address_t mask = qemu ? 0x000000ffffffffffull : 0x00000000fffff000ull;
+ 			IOBufferMemoryDescriptor *cmem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+ 			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
+-			    s->allocSize, 0x00000000fffff000ull);
++			    s->allocSize, mask);
+ 			uint64_t pa = cmem != NULL ? cmem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+-			if (cmem != NULL && (pa == 0 || pa + s->allocSize > 0x100000000ull)) {
++			if (cmem != NULL && (pa == 0 || (!qemu && pa + s->allocSize > 0x100000000ull))) {
+ 				cmem->release();
+ 				cmem = NULL;
+ 			}
