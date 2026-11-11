@@ -7,30 +7,50 @@ Does what shim/loader.c does on the phone, but on the host: places the
 kernel segments, ADT and boot_args at their physical addresses and starts
 the CPU at a 6-instruction stub that jumps to the entry with x0 = boot_args.
 virt RAM starts at 0x40000000; with 4G it covers the phone's framebuffer
-(0x9c000000) and the kernel's phys_base (0xb0000000) as plain memory.
+(0x5c000000 on topaz, see FB_BASE) and the kernel's phys_base (0xb0000000)
+as plain memory. Default CPU is cortex-a35 (ARMv8.0: PAN=0, TGran16=1).
 
 After N seconds (or when the guest stops) it writes into OUTDIR:
   fb.png     the 1080x2400 framebuffer (what the phone screen would show)
   regs.txt   QEMU's view of CPU state
-  qemu.log   exceptions with ESR/FAR/ELR (-d int,guest_errors)
+  qemu.log   guest errors (add -d int with --trace-int; very slow in userland)
 
 With --kernel KERNEL (the matching unstripped Mach-O), also decode the
-framebuffer using its iso_font into fb.txt and write result.json. This is a
-snapshot of the circular screen, not a complete boot log. --fail-on-panic
-returns 2 when a panic is visible; absence of a panic does not prove boot.
-An undecodable or blank screen returns 3 with --fail-on-panic.
+framebuffer using its iso_font into fb.txt, take mid-run snapshots
+(fb-55s.png / fb-75s.png by default; --mid-fb to change or disable), and
+dump the 4 MiB sweet_log_ring (address from _sweet_log_ring) at stop.
+--fail-on-panic returns 2 when a panic is visible; absence of a panic
+does not prove boot. An undecodable or blank screen returns 3 with
+--fail-on-panic. --keep-ram leaves ram.bin in OUTDIR (deleted by default).
 """
-import argparse, json, os, socket, struct, subprocess, sys, time, zlib
+import argparse, json, mmap, os, socket, struct, subprocess, sys, time, zlib
 
-FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
+FB_BASE, FB_W, FB_H = 0x5c000000, 1080, 2400  # must match tools/mkadt.py FB (topaz)
 FB_STRIDE = FB_W * 4
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
 BOOT_LINE_LENGTH = 608
+SWEET_LOG_RING_SIZE = 4 << 20  # bsd/dev/sweet_ufs.c persistent console ring
 
 
-def build_image(payload):
-    """Return (phys_base, ram_image, boot_args_pa, entry_pa)."""
+def nm_addr(symbols, name):
+    addrs = [int(line.split()[0], 16) for line in symbols.splitlines()
+             if line.split()[-1:] == [name]]
+    return addrs[0] if len(addrs) == 1 else None
+
+
+def parse_mid_fb(s):
+    if s in ('', '-', 'none'):
+        return []
+    return [float(x) for x in s.split(',') if x.strip()]
+
+
+def build_image(payload, ram_path=None):
+    """Return (phys_base, ram_image_or_path, boot_args_pa, entry_pa).
+
+    If ram_path is set, write a sparse ram.bin there and return the path
+    instead of a bytes object (needed for a multi-gigabyte rd=md0).
+    """
     magic, ver, nsegs = struct.unpack_from('<8sII', payload, 0)
     assert magic == b'SWEETXNU' and ver == 1, 'not a SWEETXNU v1 payload'
     virt_base, entry_va, adt_off, adt_size, kernel_end, phys_base, mem_size = \
@@ -40,16 +60,30 @@ def build_image(payload):
     adt_pa = kernel_end + delta
     ba_pa = (adt_pa + adt_size + PAGE - 1) & ~(PAGE - 1)
     top = ba_pa + PAGE
-    img = bytearray(top - phys_base)
+    ba = struct.pack('<HH4x4Q6QI4xQI', 2, 2, virt_base, phys_base, mem_size, top,
+                     FB_BASE, 1, FB_STRIDE, FB_W, FB_H, 32, 0, adt_pa - delta, adt_size)
+    ba += cmdline + b'\0' * 4 + struct.pack('<QQ', 0, mem_size)
+    assert len(ba) == 736
+    size = top - phys_base
+    if ram_path:
+        with open(ram_path, 'wb') as f:
+            f.truncate(size)
+            for i in range(nsegs):
+                vmaddr, vmsize, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
+                o = vmaddr + delta - phys_base
+                f.seek(o)
+                f.write(payload[foff:foff + fsize])
+            f.seek(adt_pa - phys_base)
+            f.write(payload[adt_off:adt_off + adt_size])
+            f.seek(ba_pa - phys_base)
+            f.write(ba)
+        return phys_base, ram_path, ba_pa, entry_va + delta
+    img = bytearray(size)
     for i in range(nsegs):
         vmaddr, vmsize, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
         o = vmaddr + delta - phys_base
         img[o:o + fsize] = payload[foff:foff + fsize]
     img[adt_pa - phys_base:adt_pa - phys_base + adt_size] = payload[adt_off:adt_off + adt_size]
-    ba = struct.pack('<HH4x4Q6QI4xQI', 2, 2, virt_base, phys_base, mem_size, top,
-                     FB_BASE, 1, FB_STRIDE, FB_W, FB_H, 32, 0, adt_pa - delta, adt_size)
-    ba += cmdline + b'\0' * 4 + struct.pack('<QQ', 0, mem_size)
-    assert len(ba) == 736
     img[ba_pa - phys_base:ba_pa - phys_base + len(ba)] = ba
     return phys_base, bytes(img), ba_pa, entry_va + delta
 
@@ -152,26 +186,34 @@ def main():
     ap.add_argument('--secs', type=float, default=20)
     ap.add_argument('--gdb', action='store_true', help='start halted, gdb stub on :1234, no timeout')
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
-    ap.add_argument('--cpu', default='cortex-a76')	# ARMv8.2 like Kryo 470, same ID_AA64MMFR0
+    # Official SWEET kernel is compiled ARMv8.0 (0081: no LSE/PAN). Real Kryo 260 is
+    # A53/A73, ID_AA64MMFR1.PAN=0. cortex-a76 is ARMv8.2 with PAN=2 and 16K pages;
+    # PAN is auto-set on EL1 exceptions when SCTLR.SPAN is unset, which this kernel
+    # never programs. a53/a57/a72 have PAN=0 but TGran16=0 (16K not advertised).
+    ap.add_argument('--cpu', default='cortex-a35', help='QEMU CPU: a35 is ARMv8.0 with TGran16=1 and PAN=0; a53/a72 have no 16K; a76 has PAN+16K')
+    ap.add_argument('--trace-int', action='store_true', help='log every guest exception to qemu.log (-d int); very slow once userspace faults')
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
+    ap.add_argument('--keep-ram', action='store_true', help='leave ram.bin in OUTDIR (deleted by default)')
+    ap.add_argument('--mid-fb', default='55,75', help='comma-separated seconds for mid-run FB snapshots when --kernel is set; "-" disables')
     a = ap.parse_args()
     if a.fail_on_panic and not a.kernel:
         ap.error('--fail-on-panic requires --kernel')
-    payload = open(a.payload, 'rb').read()
+    payload_f = open(a.payload, 'rb')
+    payload = mmap.mmap(payload_f.fileno(), 0, access=mmap.ACCESS_READ)
     font = None
+    ring_va = None
     if a.kernel:
         symbols = subprocess.check_output(['llvm-nm', '--defined-only', a.kernel], text=True)
-        fonts = [int(line.split()[0], 16) for line in symbols.splitlines()
-                 if line.split()[-1:] == ['_iso_font']]
-        if len(fonts) != 1:
+        font_addr = nm_addr(symbols, '_iso_font')
+        if font_addr is None:
             ap.error('kernel must contain exactly one _iso_font symbol')
-        font = payload_data(payload, fonts[0], 256 * 16)
+        font = payload_data(payload, font_addr, 256 * 16)
+        ring_va = nm_addr(symbols, '_sweet_log_ring')
     os.makedirs(a.outdir, exist_ok=True)
     out = os.path.abspath(a.outdir)
 
-    phys_base, img, ba_pa, entry_pa = build_image(payload)
-    open(f'{out}/ram.bin', 'wb').write(img)
+    phys_base, _ram, ba_pa, entry_pa = build_image(payload, ram_path=f'{out}/ram.bin')
     open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
     print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
 
@@ -179,11 +221,15 @@ def main():
     if os.path.exists(mon):
         os.unlink(mon)
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
+    virt_base = struct.unpack_from('<Q', payload, 0x10)[0]
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
+    # Drop the 4GiB payload mmap before QEMU starts; the font is already in memory.
+    payload.close()
+    payload_f.close()
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
-           '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
+           '-d', ('int,guest_errors,unimp' if a.trace_int else 'guest_errors,unimp'), '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
@@ -195,10 +241,34 @@ def main():
         p.wait()
         return
     t0 = time.time()
+    mid_at = parse_mid_fb(a.mid_fb)
+    mid_done = set()
     while p.poll() is None and time.time() - t0 < a.secs:
         time.sleep(0.2)
+        elapsed = time.time() - t0
+        for tsec in mid_at:
+            if tsec not in mid_done and elapsed >= tsec and a.kernel and font is not None:
+                raw_path = f'{out}/fb-{tsec}s.raw'
+                try:
+                    qmp(mon, pmemsave=(FB_BASE, FB_STRIDE * FB_H, raw_path))
+                    rawm = open(raw_path, 'rb').read()
+                    write_png(f'{out}/fb-{tsec}s.png', rawm)
+                    screen, unknown = decode_screen(rawm, font)
+                    open(f'{out}/fb-{tsec}s.txt', 'w').write(screen)
+                    os.unlink(raw_path)
+                    print(f'mid-snapshot {tsec}s unknown={unknown}', file=sys.stderr)
+                except Exception as e:
+                    print(f'mid-snapshot {tsec}s failed: {e}', file=sys.stderr)
+                mid_done.add(tsec)
     result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode}
     if p.poll() is None:
+        # Dump the 4 MiB sweet_log_ring when --kernel resolved _sweet_log_ring.
+        if ring_va is not None:
+            ring_pa = phys_base + (ring_va - virt_base)
+            try:
+                qmp(mon, pmemsave=(ring_pa, SWEET_LOG_RING_SIZE, f'{out}/sweet_log_ring.bin'))
+            except Exception as e:
+                print(f'sweet_log_ring pmemsave failed: {e}', file=sys.stderr)
         _, regs, *extra = qmp(mon, 'stop', 'info registers', *a.hmp, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
         open(f'{out}/regs.txt', 'w').write(regs + ''.join(f'\n(qemu) {c}\n{r}' for c, r in zip(a.hmp, extra)))
         p.kill()
@@ -213,8 +283,12 @@ def main():
         os.unlink(f'{out}/fb.raw')
     else:
         print(f'qemu exited early: {p.returncode}', file=sys.stderr)
-    for f in ('ram.bin',):
-        os.unlink(f'{out}/{f}')
+    if not a.keep_ram:
+        for f in ('ram.bin',):
+            try:
+                os.unlink(f'{out}/{f}')
+            except FileNotFoundError:
+                pass
     open(f'{out}/result.json', 'w').write(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result), file=sys.stderr)
     print(f'{out}/fb.png  {out}/regs.txt  {out}/qemu.log', file=sys.stderr)

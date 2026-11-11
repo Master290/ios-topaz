@@ -12,6 +12,8 @@ import adt  # noqa: E402
 # Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
 PHYS_BASE = 0xb0000000
 MEM_SIZE = 0x4d000000
+# QEMU --qemu: kernel at 0xb0000000 plus a ~4GiB rd=md0 ramdisk (and slack)
+QEMU_MEM_SIZE = 0x110000000
 # --highmem (phone only): the whole upper DDR bank. The topaz live FDT memory
 # node is <0x40000000 0x3bb00000>, <0x80000000 3G>, <0x1_40000000 4G>; every
 # fixed reserved-memory carve-out is below 0x63900000 and the dynamic pools are
@@ -80,6 +82,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = ((MID_PHYS_BASE, MID_MEM_SIZE) if midmem else
                            (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE))
+    if qemu and not midmem and not highmem:
+        mem_size = max(mem_size, QEMU_MEM_SIZE)
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -105,6 +109,10 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
         # 360x800 points (like iPhone X class devices).
         ('display-scale', u32(3)),
+        # Real D22AP /chosen has display-corner-radius as a 4-byte iBoot
+        # fill-in (zero in the IPSW tree). SpringBoard/MobileGestalt read it
+        # as points; iPhone X is 39 pt.
+        ('display-corner-radius', u32(39)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
         # files), so e.g. DataMigration never records LastSystemVersion and
@@ -132,7 +140,10 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # the Kryo 260 Silver cores have no 16K granule, so the shim boots xnu
     # on gold CPU 0x100 and parks the silver cluster. One cluster. The kernel defaults to one
     # and uses cpus=N to select an initial prefix (N <= 8).
-    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    # QEMU virt CPU0 has MPIDR 0; 0082's gold-boot check is relaxed in a QEMU
+    # kernel copy / patch (phys_id 0 or 0x100). Do not set qemu cpu0.reg to
+    # 0x100 without also setting -cpu mp-affinity=0x100 — that combination
+    # halted in halt_all_cpus with a blank FB (GIC redistributor affinity).
     cpu_nodes = []
     for core in range(1 if qemu else 4):
         cpu_nodes.append(node(f'cpu{core}', [
@@ -235,6 +246,11 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
     # ('w30r', 'b3a8') that this kernel does not provide: Safari pages stay blank.
     if product_props:
         product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
+        # iBoot would fill FLAG device-colors from syscfg/DClr; those
+        # placeholders are dropped above. Provide a stable DeviceColor so
+        # MobileGestalt/SpringBoard do not keep probing an empty color.
+        if not any(k == 'device-color' for k, _ in product_props):
+            product_props.append(('device-color', cstr('black')))
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is

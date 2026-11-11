@@ -136,6 +136,12 @@ The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=… gol
 - Stack samples (`SMP name[pid] slide S mh M` then `SMP name tN pc .. bt ..`): symbolicate shared-cache addresses with `ipsw dyld a2s dyld_shared_cache_arm64 <addr - S>`.
 - `SWEET TOUCH: ...` lines show each touch bring-up step (clocks, SE2 firmware check, chip id `54:52`).
 
+### QEMU smoke test
+
+`tools/qemu-sweet.py` boots a payload on QEMU virt. The default CPU is `cortex-a35` (ARMv8.0, PAN=0, 16K pages); `cortex-a76` sets PAN and this kernel loops in `copyin`/`copyout`. `--trace-int` is opt-in (every guest exception; very slow once userland faults). With `--kernel`, mid-run framebuffer snapshots (default 55s and 75s) and a `sweet_log_ring.bin` dump are written at stop.
+
+`mkadt.py --qemu` copies `/product` from `research/ipsw-x/d22ap.adt` (extract it from the IPSW as in step 2; the tree warns and omits the node if that file is missing — do not commit it). First-frame QEMU boot-args include `sweetqemu=1`, `sweetaccel=0` (skip the empty IOAcceleratorES stub so CoreAnimation can present without a GPU) and `sweetfb_noconsole=1` (hide the kernel console after the first iOS swap).
+
 ## Roadmap
 
 1. ~~Touch~~ and ~~buttons~~: done (patches 0083–0090).
@@ -158,6 +164,7 @@ The shim screen (red) shows `MMFR0`, the Gold hand-off and `SPEED silver=… gol
 | `.github/workflows/xnu.yml` | Kernel CI build |
 | `tools/mkadt.py` | Apple Device Tree for topaz (Gold cores, memory map, MMIO) and the iPhone X identity |
 | `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
+| `tools/qemu-sweet.py` | Boot a payload in QEMU virt (default CPU `cortex-a35`) |
 | `tools/mkiosroot.sh`, `tools/sweet-root-tweaks.py` | Build and adjust the HFS+ iOS root |
 | `tools/sweet-crash.py`, `sweet-log.py` | Symbolicate crash reports, read the persistent log |
 | `NOTES.md` | sweet's engineering log (history of the original port) |
